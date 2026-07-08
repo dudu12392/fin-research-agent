@@ -1,0 +1,62 @@
+[project]
+name = "fin-research-agent"
+version = "0.1.0"
+description = "AI-powered financial research agent using SEC filings data"
+authors = [
+    {name = "Liang Chang", email = "18845976355@163.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic-settings>=2.5.0",
+    "edgartools>=5.0.0",
+    "httpx>=0.27.0",
+    "tenacity>=9.0.0",
+    "structlog>=24.0.0",
+    "pyyaml>=6.0.0",
+    "chromadb (>=1.5.9,<2.0.0)",
+    "sentence-transformers (>=5.6.0,<6.0.0)",
+    "rank-bm25 (>=0.2.2,<0.3.0)",
+]
+
+[tool.poetry]
+packages = [
+    {include = "core", from = "src"},
+    {include = "agents", from = "src"},
+    {include = "tools", from = "src"},
+    {include = "graph", from = "src"},
+    {include = "api", from = "src"},
+    {include = "evaluation", from = "src"},
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-asyncio = ">=0.24.0"
+ruff = ">=0.6.0"
+mypy = ">=1.11.0"
+pre-commit = ">=3.8.0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

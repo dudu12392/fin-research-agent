@@ -1,0 +1,41 @@
+# Environment
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test & lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output
+output/
+dist/
+*.egg-info/
+
+# Downloaded SEC filings
+data/pdfs/
+
+# Generated data (reproducible via scripts)
+data/chunks/
+data/vector_db/
+
+# Pipeline logs
+data/pipeline.log
+
+# Output reports
+output/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+docker/.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
