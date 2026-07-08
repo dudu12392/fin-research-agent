@@ -14,6 +14,8 @@ import yaml
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+from core.logging import init_session, log_retrieval, log_llm_call
+
 load_dotenv()
 
 
@@ -42,12 +44,12 @@ class RAGGenerator:
             temperature=0.1,
         )
 
-        # ── Load prompt template ──────────────────────────────
-        prompt_path = Path(__file__).resolve().parent.parent.parent / "prompts" / "analyst.yaml"
-        with open(prompt_path, encoding="utf-8") as f:
-            prompt_data = yaml.safe_load(f)
-        self.system_prompt = prompt_data.get("system", "").strip()
-        self.user_template = prompt_data.get("user", "{query}\n{context}").strip()
+        # ── Load prompt template (versioned) ───────────────────
+        prompt_version = os.getenv("PROMPT_VERSION", "v1")
+        prompt_config = self._load_prompt(version=prompt_version)
+        self.system_prompt = prompt_config["system"].strip()
+        self.user_template = prompt_config["user"].strip()
+        self.prompt_version = prompt_config.get("version", "1.0")
 
         # ── Load pre-built persistent ChromaDB (no re-embedding) ──
         self.chunks: list[dict[str, Any]] = []
@@ -112,6 +114,13 @@ class RAGGenerator:
                 metadatas=[c["metadata"] for c in self.chunks[i:end]],
             )
 
+        # ── Conversation memory ───────────────────────────────
+        self.conversation_history: list[dict] = []
+        self.last_user_query: str = ""
+
+        # ── Audit session ─────────────────────────────────────
+        self.session_id = init_session()
+
     # ── Public API ────────────────────────────────────────────────
 
     def answer(self, query: str, top_k: int = 10) -> dict[str, Any]:
@@ -130,6 +139,12 @@ class RAGGenerator:
                 confidence: float (0-1),
             }
         """
+        # Step 0: Resolve follow-up queries via conversation history
+        if self.last_user_query and self._is_followup_query(query):
+            resolved = self._resolve_followup(query, self.last_user_query)
+            if resolved != query:
+                query = resolved
+
         # Step 1: Retrieve
         retrieved = self._retrieve(query, top_k)
 
@@ -157,6 +172,8 @@ class RAGGenerator:
 
     def _retrieve(self, query: str, top_k: int) -> list[dict[str, Any]]:
         """Vector search via ChromaDB, filtered to prioritize table chunks."""
+        import time
+        t0 = time.perf_counter()
         results = self.collection.query(query_texts=[query], n_results=top_k * 2)
 
         all_sources = []
@@ -179,6 +196,9 @@ class RAGGenerator:
         if len(sources) < 3:
             needed = min(top_k - len(sources), len(text_sources))
             sources += text_sources[:needed]
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        log_retrieval(query, sources[:5], latency_ms, self.session_id)
         return sources[:top_k]
 
     # ── Step 2: Context ───────────────────────────────────────────
@@ -201,13 +221,32 @@ class RAGGenerator:
 
     def _generate(self, query: str, context: str) -> str:
         """Call DeepSeek LLM to generate an answer."""
+        import time
+        t0 = time.perf_counter()
+
         user_msg = self.user_template.format(query=query, context=context)
-        messages = [
-            ("system", self.system_prompt),
-            ("human", user_msg),
-        ]
+        messages = [("system", self.system_prompt)]
+
+        # Inject conversation history (last 6 turns)
+        for h in self.conversation_history[-6:]:
+            role = h["role"]
+            if role == "assistant":
+                role = "ai"
+            messages.append((role, h["content"]))
+
+        messages.append(("human", user_msg))
         response = self.llm.invoke(messages)
-        return response.content.strip() if response.content else ""
+        answer = response.content.strip() if response.content else ""
+
+        # Record conversation
+        self.conversation_history.append({"role": "user", "content": query})
+        self.conversation_history.append({"role": "assistant", "content": answer})
+        self.last_user_query = query
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        log_llm_call("", answer, os.getenv("LLM_MODEL", "deepseek-chat"), latency_ms, session_id=self.session_id)
+
+        return answer
 
     # ── Step 4: Verify ────────────────────────────────────────────
 
@@ -282,3 +321,52 @@ class RAGGenerator:
         base = (has_content / len(results) + diversity) / 2
         confidence = min(base + verify_bonus, 1.0)
         return confidence
+
+    # ── Follow-up query resolution ───────────────────────────
+
+    def _is_followup_query(self, query: str) -> bool:
+        """Detect if query is a short follow-up referring to prior context."""
+        followup_patterns = ["那", "呢", "再", "也", "还"]
+        return any(p in query for p in followup_patterns) and len(query) < 20
+
+    def _resolve_followup(self, query: str, last_query: str) -> str:
+        """Use LLM to expand a follow-up query into a complete question.
+
+        E.g., "那毛利率呢？" + "Apple 2025 年营收是多少？"
+           → "Apple 2025 年毛利率是多少？"
+        """
+        prompt = (
+            "You are a query rewriter. Given a short follow-up query and the "
+            "previous user question, rewrite it as a complete, standalone question.\n"
+            f"Previous: {last_query}\n"
+            f"Follow-up: {query}\n"
+            "Rewritten query:"
+        )
+        response = self.llm.invoke([("human", prompt)])
+        rewritten = (response.content or "").strip()
+        if len(rewritten) > 5 and len(rewritten) < 200:
+            return rewritten
+        return query
+
+    def _load_prompt(self, version: str = "v1") -> dict:
+        """Load prompt template from versioned YAML file.
+
+        Args:
+            version: Prompt version identifier (e.g. 'v1', 'v2').
+
+        Returns:
+            Dict with 'version', 'date', 'system', 'user' keys.
+        """
+        import yaml as _yaml
+        from pathlib import Path as _Path
+
+        prompt_path = _Path(f"prompts/generator_{version}.yaml")
+        if not prompt_path.exists():
+            print(f"   ⚠️ Prompt {version} not found, falling back to v1")
+            prompt_path = _Path("prompts/generator_v1.yaml")
+
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            config = _yaml.safe_load(f)
+
+        print(f"   📝 Prompt: {config.get('version','?')} ({config.get('description','')[:40]})")
+        return config

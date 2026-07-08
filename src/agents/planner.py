@@ -1,44 +1,56 @@
-"""Task-planner agent — decomposes a research query into executable steps."""
+"""Task planner — decomposes complex financial queries into atomic sub-questions."""
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
-import yaml
-from pathlib import Path
-
-from agents.base import BaseAgent
-
-PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
+from langchain_openai import ChatOpenAI
 
 
-class PlannerAgent(BaseAgent):
-    """Break down a research question into a sequence of sub-tasks."""
+class PlannerAgent:
+    """Break compare/trend queries into per-company, per-year sub-queries."""
 
     def __init__(self) -> None:
-        super().__init__("planner")
-        self._system_prompt = self._load_prompt()
-
-    def _load_prompt(self) -> str:
-        path = PROMPTS_DIR / "planner.yaml"
-        with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        return data.get("system", "")
-
-    async def run(self, state: dict[str, Any]) -> dict[str, Any]:
-        query = state.get("query", "")
-        intent = state.get("intent", "")
-        self.logger.info("planning_tasks", query=query, intent=intent)
-
-        user_msg = f"Intent: {intent}\nQuery: {query}"
-        response = await self.llm.ainvoke(
-            [("system", self._system_prompt), ("human", user_msg)]
+        self.llm = ChatOpenAI(
+            model=os.getenv("LLM_MODEL", "deepseek-chat"),
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com"),
+            temperature=0.1,
+            max_tokens=512,
         )
-        try:
-            plan = json.loads(response.content or "{}")
-        except json.JSONDecodeError:
-            plan = {"steps": [{"action": "fallback", "params": {"query": query}}]}
 
-        state["plan"] = plan
-        return state
+    def decompose(self, query: str, intent: str) -> list[dict[str, Any]]:
+        """Decompose a complex query into atomic sub-queries.
+
+        Args:
+            query: User's original question.
+            intent: Classified intent (compare / trend).
+
+        Returns:
+            List of dicts with keys: sub_query, target_company, target_year, target_metric.
+        """
+        system = (
+            "You are a financial query decomposer. Break the user's question into "
+            "independent atomic sub-queries. Each sub-query asks about ONE company "
+            "and ONE year. Return ONLY a JSON array.\n\n"
+            "Format:\n"
+            '[{"sub_query": "...", "target_company": "AAPL", "target_year": 2025, "target_metric": "revenue"}, ...]\n\n'
+            "For compare intents: decompose into one sub-query per company.\n"
+            "For trend intents: decompose into one sub-query per year.\n"
+            "For unknown years, use null. For unknown metrics, use 'summary'."
+        )
+
+        response = self.llm.invoke([("system", system), ("human", query)])
+        content = response.content or "[]"
+
+        try:
+            # Strip markdown code fences
+            if "```" in content:
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            return json.loads(content.strip())
+        except json.JSONDecodeError:
+            return [{"sub_query": query, "target_company": "AAPL", "target_year": 2025, "target_metric": "summary"}]
